@@ -25,6 +25,7 @@ async function decodeAudioData(data, ctx, sampleRate, numChannels) {
 async function withRetry(fn, retries = 3, delay = 1000) {
   try { return await fn(); } catch (err) {
     if (retries <= 0) throw err;
+    console.warn(`Retrying API call... (${retries} left)`);
     await new Promise(r => setTimeout(r, delay));
     return withRetry(fn, retries - 1, delay * 2);
   }
@@ -43,7 +44,7 @@ export const generateSpeechForText = async (text, audioCtx) => {
       }
     });
     const base64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    if (!base64) throw new Error("音声生成に失敗しました。");
+    if (!base64) throw new Error("音声データの取得に失敗しました。");
     const bytes = decode(base64);
     return await decodeAudioData(bytes, audioCtx, 24000, 1);
   });
@@ -54,51 +55,64 @@ export const generateSpeechForText = async (text, audioCtx) => {
  */
 export const analyzePdfForPpt = async (base64Data, pageCount) => {
   const ai = getAI();
-  const prompt = `このPDFドキュメントを全${pageCount}ページ分、ページごとに分析し、各ページのタイトルと「スピーカーノート（丁寧な語り口の解説文）」を作成してください。
-出力は必ず以下のJSONフォーマットで回答してください。
+  const prompt = `このPDFドキュメント（全${pageCount}ページ）を分析し、各ページの内容に基づいたタイトルと、ナレーション用の丁寧な解説文（スピーカーノート）を生成してください。
+全てのページを必ず含め、以下のJSONフォーマットで回答してください。
 
 {
-  "presentationTitle": "ドキュメント全体のタイトル",
-  "summary": "内容の簡単な要約",
+  "presentationTitle": "タイトル",
+  "summary": "要約",
   "slides": [
-    { "pageIndex": 0, "title": "そのページのタイトル", "notes": "ナレーション用の解説文" }
+    { "pageIndex": 0, "title": "見出し", "notes": "解説文" }
   ]
 }`;
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-3-flash-preview',
-    contents: {
-      parts: [
-        { inlineData: { mimeType: 'application/pdf', data: base64Data } },
-        { text: prompt }
-      ]
-    },
-    config: {
-      responseMimeType: "application/json",
-      responseSchema: {
-        type: "OBJECT",
-        properties: {
-          presentationTitle: { type: "STRING" },
-          summary: { type: "STRING" },
-          slides: {
-            type: "ARRAY",
-            items: {
-              type: "OBJECT",
-              properties: {
-                pageIndex: { type: "INTEGER" },
-                title: { type: "STRING" },
-                notes: { type: "STRING" }
-              },
-              required: ["pageIndex", "title", "notes"]
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: [{
+        parts: [
+          { inlineData: { mimeType: 'application/pdf', data: base64Data } },
+          { text: prompt }
+        ]
+      }],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: "OBJECT",
+          properties: {
+            presentationTitle: { type: "STRING" },
+            summary: { type: "STRING" },
+            slides: {
+              type: "ARRAY",
+              items: {
+                type: "OBJECT",
+                properties: {
+                  pageIndex: { type: "INTEGER" },
+                  title: { type: "STRING" },
+                  notes: { type: "STRING" }
+                },
+                required: ["pageIndex", "title", "notes"]
+              }
             }
-          }
-        },
-        required: ["presentationTitle", "summary", "slides"]
+          },
+          required: ["presentationTitle", "summary", "slides"]
+        }
       }
-    }
-  });
+    });
 
-  const resultText = response.text;
-  if (!resultText) throw new Error("AI解析結果が取得できませんでした。");
-  return JSON.parse(resultText);
+    const resultText = response.text;
+    if (!resultText) {
+      throw new Error("AIからの応答が空です。APIキーの設定や制限を確認してください。");
+    }
+    
+    try {
+      return JSON.parse(resultText);
+    } catch (parseError) {
+      console.error("JSON Parse Error:", resultText);
+      throw new Error("AIの応答を解析できませんでした（JSON形式エラー）。");
+    }
+  } catch (apiError) {
+    console.error("Gemini API Error:", apiError);
+    throw new Error(`AI解析中にエラーが発生しました: ${apiError.message}`);
+  }
 };

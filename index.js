@@ -2,13 +2,15 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { analyzePdfForPpt, generateSpeechForText } from './services/gemini.js';
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://esm.sh/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs`;
+// バージョンを厳密に指定
+const PDFJS_VERSION = '4.10.38';
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://esm.sh/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
 
 // --- State ---
 let state = {
   targetFile: null,
   analysis: null,
-  status: 'idle', // idle, analyzing, reviewing, audio_generating, video_recording, completed
+  status: 'idle', 
   progress: 0,
   loadingMsg: ""
 };
@@ -86,6 +88,8 @@ const updateUI = () => {
 const showError = (msg) => {
   els.errorMessage.innerText = msg;
   els.errorModal.classList.remove('hidden');
+  state.status = 'idle';
+  updateUI();
 };
 
 const setProgress = (p, msg) => {
@@ -95,21 +99,26 @@ const setProgress = (p, msg) => {
 };
 
 const renderPdfToImages = async (file) => {
-  const arrayBuffer = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-  const images = [];
-  for (let i = 1; i <= pdf.numPages; i++) {
-    setProgress(Math.floor((i / pdf.numPages) * 30), `資料を画像に変換中... (${i}/${pdf.numPages})`);
-    const page = await pdf.getPage(i);
-    const viewport = page.getViewport({ scale: 2.0 });
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-    canvas.height = viewport.height;
-    canvas.width = viewport.width;
-    await page.render({ canvasContext: ctx, viewport }).promise;
-    images.push(canvas.toDataURL('image/jpeg', 0.85));
+  try {
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    const images = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      setProgress(Math.floor((i / pdf.numPages) * 30), `資料を画像に変換中... (${i}/${pdf.numPages})`);
+      const page = await pdf.getPage(i);
+      const viewport = page.getViewport({ scale: 2.0 });
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      canvas.height = viewport.height;
+      canvas.width = viewport.width;
+      await page.render({ canvasContext: ctx, viewport }).promise;
+      images.push(canvas.toDataURL('image/jpeg', 0.85));
+    }
+    return { images, numPages: pdf.numPages };
+  } catch (err) {
+    console.error("PDF Render Error:", err);
+    throw new Error("PDFファイルの読み込みに失敗しました。ファイルが壊れているか、非対応の形式です。");
   }
-  return { images, numPages: pdf.numPages };
 };
 
 const startAnalysis = async () => {
@@ -118,20 +127,29 @@ const startAnalysis = async () => {
   updateUI();
   
   try {
+    // 1. PDFの画像化
+    const { images, numPages } = await renderPdfToImages(state.targetFile);
+    
+    // 2. Base64データの準備
+    setProgress(40, "AIにデータを送信する準備をしています...");
     const reader = new FileReader();
-    const base64 = await new Promise((resolve) => {
+    const base64 = await new Promise((resolve, reject) => {
       reader.onload = () => resolve(reader.result.split(',')[1]);
+      reader.onerror = () => reject(new Error("ファイルの読み取りに失敗しました。"));
       reader.readAsDataURL(state.targetFile);
     });
 
-    const { images, numPages } = await renderPdfToImages(state.targetFile);
-    setProgress(50, "AIがドキュメントを読み取っています...");
-    
+    // 3. Gemini APIでの解析
+    setProgress(60, "AIがドキュメントを読み取っています...");
     const aiResult = await analyzePdfForPpt(base64, numPages);
     
+    if (!aiResult.slides || aiResult.slides.length === 0) {
+      throw new Error("AIがスライドの内容を正しく抽出できませんでした。");
+    }
+
     state.analysis = {
-      presentationTitle: aiResult.presentationTitle,
-      summary: aiResult.summary,
+      presentationTitle: aiResult.presentationTitle || state.targetFile.name,
+      summary: aiResult.summary || "解説スクリプトが生成されました。",
       slides: aiResult.slides.map((s, idx) => ({
         ...s,
         imageUrl: images[idx] || null
@@ -142,8 +160,8 @@ const startAnalysis = async () => {
     renderSlides();
     updateUI();
   } catch (err) {
-    console.error(err);
-    showError("解析に失敗しました: " + err.message);
+    console.error("Analysis Flow Error:", err);
+    showError(err.message);
   }
 };
 
@@ -190,7 +208,10 @@ const drawFrame = async (ctx, canvas, slide) => {
   if (slide.imageUrl) {
     const img = new Image();
     img.src = slide.imageUrl;
-    await new Promise(r => img.onload = r);
+    await new Promise((r, reject) => {
+      img.onload = r;
+      img.onerror = () => reject(new Error("画像のレンダリングに失敗しました。"));
+    });
     const ratio = Math.min(canvas.width / img.width, canvas.height / img.height);
     const nw = img.width * ratio;
     const nh = img.height * ratio;
@@ -224,12 +245,16 @@ const createVideo = async () => {
     const stream = canvas.captureStream(30);
     dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
     
-    const recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9,opus', videoBitsPerSecond: 5000000 });
+    const recorder = new MediaRecorder(stream, { 
+      mimeType: 'video/webm;codecs=vp9,opus', 
+      videoBitsPerSecond: 5000000 
+    });
     const chunks = [];
     recorder.ondataavailable = e => chunks.push(e.data);
     
-    const recordingFinished = new Promise(resolve => {
+    const recordingFinished = new Promise((resolve, reject) => {
       recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' }));
+      recorder.onerror = () => reject(new Error("録画中にエラーが発生しました。"));
     });
 
     recorder.start();
@@ -248,7 +273,7 @@ const createVideo = async () => {
       const duration = slide.audioBuffer.duration;
       source.start();
       
-      const endTime = Date.now() + (duration * 1000) + 1200; // 余韻
+      const endTime = Date.now() + (duration * 1000) + 1200; 
       while (Date.now() < endTime) {
         await new Promise(r => requestAnimationFrame(r));
       }
@@ -263,7 +288,7 @@ const createVideo = async () => {
     state.status = 'completed';
     updateUI();
   } catch (err) {
-    console.error(err);
+    console.error("Video Generation Error:", err);
     showError("動画生成に失敗しました: " + err.message);
   } finally {
     audioCtx.close();
