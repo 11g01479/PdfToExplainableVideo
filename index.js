@@ -2,15 +2,13 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import { analyzePdfForPpt, generateSpeechForText } from './services/gemini.js';
 
-// バージョンを厳密に指定
-const PDFJS_VERSION = '4.10.38';
-pdfjsLib.GlobalWorkerOptions.workerSrc = `https://esm.sh/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://esm.sh/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs`;
 
 // --- State ---
 let state = {
   targetFile: null,
   analysis: null,
-  status: 'idle', 
+  status: 'idle', // idle, analyzing, reviewing, audio_generating, video_recording, completed
   progress: 0,
   loadingMsg: ""
 };
@@ -88,8 +86,6 @@ const updateUI = () => {
 const showError = (msg) => {
   els.errorMessage.innerText = msg;
   els.errorModal.classList.remove('hidden');
-  state.status = 'idle';
-  updateUI();
 };
 
 const setProgress = (p, msg) => {
@@ -99,26 +95,24 @@ const setProgress = (p, msg) => {
 };
 
 const renderPdfToImages = async (file) => {
-  try {
-    const arrayBuffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    const images = [];
-    for (let i = 1; i <= pdf.numPages; i++) {
-      setProgress(Math.floor((i / pdf.numPages) * 30), `資料を画像に変換中... (${i}/${pdf.numPages})`);
-      const page = await pdf.getPage(i);
-      const viewport = page.getViewport({ scale: 2.0 });
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
-      await page.render({ canvasContext: ctx, viewport }).promise;
-      images.push(canvas.toDataURL('image/jpeg', 0.85));
-    }
-    return { images, numPages: pdf.numPages };
-  } catch (err) {
-    console.error("PDF Render Error:", err);
-    throw new Error("PDFファイルの読み込みに失敗しました。");
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const images = [];
+  // 動画サイズが720pなので、スケールを2.0から1.5に落としてメモリ消費を削減
+  const scale = 1.5; 
+  
+  for (let i = 1; i <= pdf.numPages; i++) {
+    setProgress(Math.floor((i / pdf.numPages) * 30), `資料を画像に変換中... (${i}/${pdf.numPages})`);
+    const page = await pdf.getPage(i);
+    const viewport = page.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.height = viewport.height;
+    canvas.width = viewport.width;
+    await page.render({ canvasContext: ctx, viewport }).promise;
+    images.push(canvas.toDataURL('image/jpeg', 0.8)); // 圧縮率をわずかに上げてメモリ負荷を軽減
   }
+  return { images, numPages: pdf.numPages };
 };
 
 const startAnalysis = async () => {
@@ -127,22 +121,20 @@ const startAnalysis = async () => {
   updateUI();
   
   try {
-    const { images, numPages } = await renderPdfToImages(state.targetFile);
-    
-    setProgress(40, "AIにデータを送信する準備をしています...");
     const reader = new FileReader();
-    const base64 = await new Promise((resolve, reject) => {
+    const base64 = await new Promise((resolve) => {
       reader.onload = () => resolve(reader.result.split(',')[1]);
-      reader.onerror = () => reject(new Error("ファイルの読み取りに失敗しました。"));
       reader.readAsDataURL(state.targetFile);
     });
 
-    setProgress(60, "AIがドキュメントを読み取っています...");
+    const { images, numPages } = await renderPdfToImages(state.targetFile);
+    setProgress(40, "AIがドキュメントを解析しています...");
+    
     const aiResult = await analyzePdfForPpt(base64, numPages);
     
     state.analysis = {
-      presentationTitle: aiResult.presentationTitle || state.targetFile.name,
-      summary: aiResult.summary || "解説スクリプトが生成されました。",
+      presentationTitle: aiResult.presentationTitle,
+      summary: aiResult.summary,
       slides: aiResult.slides.map((s, idx) => ({
         ...s,
         imageUrl: images[idx] || null
@@ -153,8 +145,8 @@ const startAnalysis = async () => {
     renderSlides();
     updateUI();
   } catch (err) {
-    console.error("Analysis Error:", err);
-    showError(err.message);
+    console.error(err);
+    showError("解析に失敗しました: " + (err.message || "予期せぬエラー"));
   }
 };
 
@@ -169,7 +161,7 @@ const renderSlides = () => {
     
     slideEl.innerHTML = `
       <div class="md:w-1/3 aspect-video bg-black rounded-2xl overflow-hidden border border-slate-800 shadow-2xl group-hover:scale-[1.02] transition-transform">
-        <img src="${slide.imageUrl}" class="w-full h-full object-contain" />
+        <img src="${slide.imageUrl}" class="w-full h-full object-contain" loading="lazy" />
       </div>
       <div class="md:w-2/3 space-y-4">
         <div class="flex items-center gap-3">
@@ -201,9 +193,9 @@ const drawFrame = async (ctx, canvas, slide) => {
   if (slide.imageUrl) {
     const img = new Image();
     img.src = slide.imageUrl;
-    await new Promise((r, reject) => {
-      img.onload = r;
-      img.onerror = () => reject(new Error("画像の読み込みに失敗しました。"));
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
     });
     const ratio = Math.min(canvas.width / img.width, canvas.height / img.height);
     const nw = img.width * ratio;
@@ -212,54 +204,71 @@ const drawFrame = async (ctx, canvas, slide) => {
   }
 };
 
+const getSupportedMimeType = () => {
+  const types = [
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm',
+    'video/mp4'
+  ];
+  for (const type of types) {
+    if (MediaRecorder.isTypeSupported(type)) return type;
+  }
+  return '';
+};
+
 const createVideo = async () => {
-  // AudioContextはユーザー操作直後に作成/再開が必要
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === 'suspended') await audioCtx.resume();
   
   try {
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    
     state.status = 'audio_generating';
     setProgress(0, "AI音声を合成中...");
 
     const slides = state.analysis.slides;
     for (let i = 0; i < slides.length; i++) {
       setProgress(Math.floor((i / slides.length) * 50), `音声を合成中... (${i + 1}/${slides.length})`);
-      
-      // レートリミット対策として少し待機
-      if (i > 0) await new Promise(r => setTimeout(r, 600));
-      
       slides[i].audioBuffer = await generateSpeechForText(slides[i].notes, audioCtx);
     }
 
     state.status = 'video_recording';
-    setProgress(50, "動画をレンダリング中...");
+    setProgress(50, "動画を出力中...");
     
     const canvas = els.canvas;
     canvas.width = 1280;
     canvas.height = 720;
-    const ctx = canvas.getContext('2d');
+    const ctx = canvas.getContext('2d', { alpha: false }); // パフォーマンス向上のためアルファチャネル無効
     
     const dest = audioCtx.createMediaStreamDestination();
     const stream = canvas.captureStream(30);
     dest.stream.getAudioTracks().forEach(t => stream.addTrack(t));
     
+    const mimeType = getSupportedMimeType();
+    if (!mimeType) throw new Error("このブラウザは動画の録画をサポートしていません。");
+    
     const recorder = new MediaRecorder(stream, { 
-      mimeType: 'video/webm;codecs=vp9,opus', 
-      videoBitsPerSecond: 5000000 
+      mimeType, 
+      videoBitsPerSecond: 4000000 // 5Mbpsから4Mbpsに下げて安定性を向上
     });
     const chunks = [];
-    recorder.ondataavailable = e => chunks.push(e.data);
+    recorder.ondataavailable = e => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
     
-    const recordingFinished = new Promise((resolve) => {
-      recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' }));
+    const recordingFinished = new Promise((resolve, reject) => {
+      recorder.onstop = () => resolve(new Blob(chunks, { type: mimeType }));
+      recorder.onerror = reject;
     });
 
     recorder.start();
-    await new Promise(r => setTimeout(r, 800)); // 安定化
+    // 録画開始直後の空白時間を最小限にする
+    await new Promise(r => setTimeout(r, 200));
 
     for (let i = 0; i < slides.length; i++) {
       const slide = slides[i];
-      setProgress(50 + Math.floor((i / slides.length) * 50), `エンコード中: ${i + 1}/${slides.length}`);
+      setProgress(50 + Math.floor((i / slides.length) * 50), `レンダリング中: ${i + 1}/${slides.length}`);
+      
       await drawFrame(ctx, canvas, slide);
       
       const source = audioCtx.createBufferSource();
@@ -270,11 +279,11 @@ const createVideo = async () => {
       const duration = slide.audioBuffer.duration;
       source.start();
       
-      // 音声の長さ分だけ録画（少し長めに待機して音声の切れを防ぐ）
-      const endTime = Date.now() + (duration * 1000) + 1000; 
-      while (Date.now() < endTime) {
-        await new Promise(r => requestAnimationFrame(r));
-      }
+      // 音声の長さに合わせて待機（1秒の余韻を追加）
+      const totalWait = (duration * 1000) + 1000;
+      await new Promise(r => setTimeout(r, totalWait));
+      
+      source.disconnect();
     }
 
     recorder.stop();
@@ -282,15 +291,15 @@ const createVideo = async () => {
     const url = URL.createObjectURL(blob);
     els.outputVideo.src = url;
     els.downloadLink.href = url;
+    els.downloadLink.download = `ai_pdf_movie_${Date.now()}.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`;
     
     state.status = 'completed';
     updateUI();
   } catch (err) {
-    console.error("Video Generation Error:", err);
-    showError("動画の作成中に問題が発生しました。");
+    console.error(err);
+    showError("動画生成に失敗しました: " + (err.message || "リソース不足かブラウザの制限です。"));
   } finally {
-    // 完全に終わるまでAudioContextを閉じない
-    setTimeout(() => { if(audioCtx.state !== 'closed') audioCtx.close(); }, 2000);
+    if (audioCtx.state !== 'closed') audioCtx.close();
   }
 };
 
@@ -303,8 +312,12 @@ els.fileInput.addEventListener('change', (e) => {
     state.targetFile = file;
     els.fileNameDisplay.innerText = file.name;
     els.uploadActions.classList.remove('hidden');
+    // ステータスをリセット
+    state.status = 'idle';
+    updateUI();
   } else {
     alert("PDFファイルを選択してください。");
+    els.fileInput.value = "";
   }
 });
 
