@@ -2,6 +2,7 @@
 export interface Slide {
   title: string;
   notes: string;
+  content?: string[]; // スライドに表示するテキスト
   pageIndex: number;
   imageUrl?: string;
   audioBuffer?: AudioBuffer; // 生成された音声データ

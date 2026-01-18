@@ -1,5 +1,5 @@
 {
-  "name": "PDFから解説動画作成_new",
+  "name": "PDFから解説動画作成：HTML",
   "description": "無料で利用可能。PDFの各ページをAIが解析し、音声付き解説動画と詳細なノート付きパワーポイントを自動生成します。",
   "requestFramePermissions": []
 }
