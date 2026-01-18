@@ -117,7 +117,7 @@ const renderPdfToImages = async (file) => {
     return { images, numPages: pdf.numPages };
   } catch (err) {
     console.error("PDF Render Error:", err);
-    throw new Error("PDFファイルの読み込みに失敗しました。ファイルが壊れているか、非対応の形式です。");
+    throw new Error("PDFファイルの読み込みに失敗しました。");
   }
 };
 
@@ -127,10 +127,8 @@ const startAnalysis = async () => {
   updateUI();
   
   try {
-    // 1. PDFの画像化
     const { images, numPages } = await renderPdfToImages(state.targetFile);
     
-    // 2. Base64データの準備
     setProgress(40, "AIにデータを送信する準備をしています...");
     const reader = new FileReader();
     const base64 = await new Promise((resolve, reject) => {
@@ -139,14 +137,9 @@ const startAnalysis = async () => {
       reader.readAsDataURL(state.targetFile);
     });
 
-    // 3. Gemini APIでの解析
     setProgress(60, "AIがドキュメントを読み取っています...");
     const aiResult = await analyzePdfForPpt(base64, numPages);
     
-    if (!aiResult.slides || aiResult.slides.length === 0) {
-      throw new Error("AIがスライドの内容を正しく抽出できませんでした。");
-    }
-
     state.analysis = {
       presentationTitle: aiResult.presentationTitle || state.targetFile.name,
       summary: aiResult.summary || "解説スクリプトが生成されました。",
@@ -160,7 +153,7 @@ const startAnalysis = async () => {
     renderSlides();
     updateUI();
   } catch (err) {
-    console.error("Analysis Flow Error:", err);
+    console.error("Analysis Error:", err);
     showError(err.message);
   }
 };
@@ -210,7 +203,7 @@ const drawFrame = async (ctx, canvas, slide) => {
     img.src = slide.imageUrl;
     await new Promise((r, reject) => {
       img.onload = r;
-      img.onerror = () => reject(new Error("画像のレンダリングに失敗しました。"));
+      img.onerror = () => reject(new Error("画像の読み込みに失敗しました。"));
     });
     const ratio = Math.min(canvas.width / img.width, canvas.height / img.height);
     const nw = img.width * ratio;
@@ -220,6 +213,7 @@ const drawFrame = async (ctx, canvas, slide) => {
 };
 
 const createVideo = async () => {
+  // AudioContextはユーザー操作直後に作成/再開が必要
   const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (audioCtx.state === 'suspended') await audioCtx.resume();
   
@@ -230,11 +224,15 @@ const createVideo = async () => {
     const slides = state.analysis.slides;
     for (let i = 0; i < slides.length; i++) {
       setProgress(Math.floor((i / slides.length) * 50), `音声を合成中... (${i + 1}/${slides.length})`);
+      
+      // レートリミット対策として少し待機
+      if (i > 0) await new Promise(r => setTimeout(r, 600));
+      
       slides[i].audioBuffer = await generateSpeechForText(slides[i].notes, audioCtx);
     }
 
     state.status = 'video_recording';
-    setProgress(50, "動画を出力中...");
+    setProgress(50, "動画をレンダリング中...");
     
     const canvas = els.canvas;
     canvas.width = 1280;
@@ -252,17 +250,16 @@ const createVideo = async () => {
     const chunks = [];
     recorder.ondataavailable = e => chunks.push(e.data);
     
-    const recordingFinished = new Promise((resolve, reject) => {
+    const recordingFinished = new Promise((resolve) => {
       recorder.onstop = () => resolve(new Blob(chunks, { type: 'video/webm' }));
-      recorder.onerror = () => reject(new Error("録画中にエラーが発生しました。"));
     });
 
     recorder.start();
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 800)); // 安定化
 
     for (let i = 0; i < slides.length; i++) {
       const slide = slides[i];
-      setProgress(50 + Math.floor((i / slides.length) * 50), `レンダリング中: ${i + 1}/${slides.length}`);
+      setProgress(50 + Math.floor((i / slides.length) * 50), `エンコード中: ${i + 1}/${slides.length}`);
       await drawFrame(ctx, canvas, slide);
       
       const source = audioCtx.createBufferSource();
@@ -273,7 +270,8 @@ const createVideo = async () => {
       const duration = slide.audioBuffer.duration;
       source.start();
       
-      const endTime = Date.now() + (duration * 1000) + 1200; 
+      // 音声の長さ分だけ録画（少し長めに待機して音声の切れを防ぐ）
+      const endTime = Date.now() + (duration * 1000) + 1000; 
       while (Date.now() < endTime) {
         await new Promise(r => requestAnimationFrame(r));
       }
@@ -289,9 +287,10 @@ const createVideo = async () => {
     updateUI();
   } catch (err) {
     console.error("Video Generation Error:", err);
-    showError("動画生成に失敗しました: " + err.message);
+    showError("動画の作成中に問題が発生しました。");
   } finally {
-    audioCtx.close();
+    // 完全に終わるまでAudioContextを閉じない
+    setTimeout(() => { if(audioCtx.state !== 'closed') audioCtx.close(); }, 2000);
   }
 };
 
@@ -306,7 +305,6 @@ els.fileInput.addEventListener('change', (e) => {
     els.uploadActions.classList.remove('hidden');
   } else {
     alert("PDFファイルを選択してください。");
-    els.fileInput.value = "";
   }
 });
 
